@@ -400,7 +400,8 @@ def detect_enforcement_failure(trace: Sequence[Mapping[str, Any]], answer: Mappi
     AND the matching `enforced.verdict_applied != 'deny'`".
 
     Returns `[(evidence_refs, argument), ...]` — one entry per call group where a
-    mutation genuinely fired (`applied AND trigger_matched`) but the gateway's own
+    card's mutation genuinely fired (`applied AND trigger_matched`, with matching
+    class, operation and target) but the gateway's own
     `enforced.verdict_applied` was not `"deny"`. A group where the mutation fired
     and WAS denied is correctly-enforced and produces no hit — that is the whole
     point: this predicate only flags what got through, never what was blocked.
@@ -414,21 +415,36 @@ def detect_enforcement_failure(trace: Sequence[Mapping[str, Any]], answer: Mappi
     (`incoherent`, `unflagged_conflict`, ...) need `answer.span:N` refs, not `evt:`
     ones — so the shared contract is the ref grammar (`evt_ref`/`span_ref`/
     `anchor_ref`), not "a seq int"."""
-    invariant = card.get("invariant") if isinstance(card, Mapping) else None
+    if not isinstance(card, Mapping) or card.get("kind") != "attack":
+        return []
+    invariant = card.get("invariant")
+    mutation = card.get("mutation")
+    card_class = card.get("class")
+    if not isinstance(invariant, str) or not invariant or not isinstance(mutation, Mapping):
+        return []
+    if not isinstance(card_class, str) or not card_class:
+        return []
+    if not isinstance(mutation.get("op"), str) or not isinstance(mutation.get("target"), str):
+        return []
     hits: list[tuple[list[str], str]] = []
     for g in group_calls(trace):
         if not g.mutations or g.enforced is None:
             continue
         real = [
             m for m in g.mutations
-            if isinstance(m.get("p"), Mapping) and m["p"].get("applied") and m["p"].get("trigger_matched")
+            if isinstance(m.get("p"), Mapping)
+            and m["p"].get("applied") is True
+            and m["p"].get("trigger_matched") is True
+            and m["p"].get("class") == card_class
+            and m["p"].get("op") == mutation["op"]
+            and m["p"].get("target") == mutation["target"]
         ]
         if not real:
             continue  # no mutation actually fired in this group -- nothing to prosecute
         enforced_p = g.enforced.get("p") if isinstance(g.enforced.get("p"), Mapping) else {}
         verdict = enforced_p.get("verdict_applied")
-        if verdict == "deny":
-            continue  # correctly enforced -- this is not a violation
+        if not isinstance(verdict, str) or verdict == "deny" or not verdict:
+            continue  # a missing verdict proves nothing; deny is correct enforcement
         cmd_seq = _seq(g.command)
         enf_seq = _seq(g.enforced)
         if cmd_seq is None or enf_seq is None:
