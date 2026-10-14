@@ -1,6 +1,6 @@
 {
  "version": 1,
- "team": "starter-deck",
+ "team": "MeMe",
  "cards": [
   {
    "id": "atk_01",
@@ -93,10 +93,9 @@
    "id": "atk_04",
    "kind": "attack",
    "ask": {
-    "type": "define_term",
-    "term": "streamable http transport",
+    "type": "source_of",
+    "claim": "Claim:claim-032daacb/c/001",
     "require": [
-     "definition",
      "anchor"
     ]
    },
@@ -203,10 +202,9 @@
    "id": "atk_08",
    "kind": "attack",
    "ask": {
-    "type": "define_term",
-    "term": "agent card",
+    "type": "source_of",
+    "claim": "Claim:claim-032daacb/c/001",
     "require": [
-     "definition",
      "anchor"
     ]
    },
@@ -258,11 +256,11 @@
    "id": "atk_10",
    "kind": "attack",
    "ask": {
-    "type": "define_term",
-    "term": "delegation depth",
+    "type": "record_mastery",
+    "learner": "Learner:sv-0417",
+    "concept": "Concept:traceparent-header/w/062",
     "require": [
-     "definition",
-     "anchor"
+     "receipt_id"
     ]
    },
    "class": "identity",

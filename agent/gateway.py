@@ -58,18 +58,11 @@ credit penalty PLUS an `integrity` event that hands the prosecutor a free
 agent/README.md's own table. Getting this file to just plainly return valid
 `Decision` values, every time, is worth more than getting it clever.
 
-THE STARTER'S SHAPE (read this before you start editing `decide()`)
+THE DEFENSIVE POLICY
 ----------------------------------------------------------------------------
-This starter FORWARDS ALMOST EVERYTHING AND DENIES NOTHING. That is not a
-placeholder oversight — it is the honest zero-defence baseline you are
-meant to beat: `bots/rookie` in the kit's own ladder does exactly the same
-thing, and RULES.md's own words are "if you cannot beat Rookie you have a
-bug, not a strategy." `decide()` below is structured as four named jobs —
-ROUTE, ADMIT, AUTHORIZE, BUDGET — each with a one-line TODO naming what a
-real implementation checks and why. None of the four currently rejects,
-rewrites, or reroutes anything; they are seams, not solutions. Fill them in
-using `agent/strategy.py` (routing/budget policy) and `agent/guardrails.py`
-(the safety checks) — both already import cleanly from here.
+`decide()` enforces routing, lease, authority, write-header and budget checks
+before a call is executed. It rewrites deprecated tools and costly catalog
+masks. It denies calls when the required evidence is absent.
 
 ONE THING WORTH INTERNALISING BEFORE YOU WRITE YOUR FIRST REAL CHECK:
 `verdict="deny"` costs the CALLER (your own team) **zero credits** —
@@ -85,7 +78,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +106,8 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import is_catalog_trap, successor_of
+from kit.mcp.specs import TOOL_SPECS, cost as tool_cost
 
 __all__ = [
     "COMMAND_KINDS",
@@ -350,6 +345,13 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._used_idempotency_keys: set[str] = set()
+        self._admitted_cards: dict[str, dict] = {}
+
+    def note_card(self, server: str, card: dict) -> None:
+        """Remember a verified registry card supplied by the surrounding loop."""
+        if isinstance(server, str) and isinstance(card, dict):
+            self._admitted_cards[server] = dict(card)
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -361,10 +363,7 @@ class Gateway:
         check" against something external looks. Everything you need to
         decide is already sitting in `cmd` and `self.ctx`.
 
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        The four jobs below are named, ordered, and enforced before returning."""
         self._telemetry.decision_seen(cmd)
 
         # ------------------------------------------------------------------
@@ -376,7 +375,21 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        successor = successor_of(cmd.server, cmd.tool)
+        routed = replace(cmd, server=successor[0], tool=successor[1]) if successor else cmd
+        headers = {str(k).lower(): v for k, v in routed.headers.items()}
+        if routed.args.get("route") or routed.args.get("_route") or routed.args.get("replica"):
+            return self.deny(cmd, "routing must be specified in the header")
+        if routed.kind == "a2a":
+            card = self._admitted_cards.get(routed.server)
+            if card is not None and (not card.get("verified") or routed.tool not in card.get("skills", ())):
+                return self.deny(cmd, "peer card is unverified or does not declare the skill")
+            aud = headers.get("aud")
+            if aud is not None and aud not in (routed.server, f"a2a:{routed.server}", f"mcp:{routed.server}"):
+                return self.deny(cmd, "delegation audience does not match the peer")
+            act = headers.get("act") or routed.args.get("act")
+            if act is not None and str(act).lower() != str(self.ctx.act).lower():
+                return self.deny(cmd, "delegation act does not match the learner")
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +401,9 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        if (routed.server, routed.tool) == ("slides", "get_frame"):
+            if not routed.lease_id or routed.lease_id not in self.ctx.leases:
+                return self.deny(cmd, "slides.get_frame requires a live lease")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -402,8 +417,23 @@ class Gateway:
         # `verify_delegation` is the real worked example of an authority
         # check over a signed token, for the A2A-specific version of this
         # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        spec = TOOL_SPECS.get((routed.server, routed.tool))
+        is_write = bool(spec and spec.is_write) or (routed.server, routed.tool) in {
+            ("progress", "record_mastery"), ("content", "flag_stale_slide"),
+            ("content", "file_content_bug"), ("registry", "pin"),
+        }
+        if is_write:
+            for key in ("learner", "learner_id", "target", "subject"):
+                target = routed.args.get(key)
+                if target and str(target).split(":")[-1].lower() != str(self.ctx.act).split(":")[-1].lower():
+                    return self.deny(cmd, "write target is outside ctx.act")
+            if f"wiki.write:{routed.server}" not in self.ctx.scopes:
+                return self.deny(cmd, "write scope is absent")
+            if not headers.get("if-match") or not headers.get("idempotency-key"):
+                return self.deny(cmd, "write requires If-Match and Idempotency-Key")
+            idem = str(headers["idempotency-key"])
+            if idem in self._used_idempotency_keys:
+                return self.deny(cmd, "idempotency key already used this duel")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
@@ -417,11 +447,24 @@ class Gateway:
         # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
         # REWRITE `routed.fields` down to the tool's cheap default instead
         # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            narrow = ("name",) if routed.server == "registry" else ("term",)
+            routed = replace(routed, fields=narrow)
+        if spec and routed.fields == ("*",):
+            routed = replace(routed, fields=tuple(spec.default_fields))
+        if spec:
+            try:
+                estimated = tool_cost(routed.server, routed.tool, routed.fields, 1)
+            except (KeyError, ValueError):
+                return self.deny(cmd, "unknown field mask")
+            if estimated > self.ctx.credits:
+                return self.deny(cmd, "insufficient credits for call")
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        if is_write:
+            self._used_idempotency_keys.add(str(headers["idempotency-key"]))
+        rewritten = routed != cmd
+        decision = Decision(verdict="rewrite" if rewritten else "forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
@@ -529,7 +572,7 @@ if __name__ == "__main__":
         else:
             raise AssertionError("expected ValueError for an 'answer' action")
 
-    print("\n=== Gateway.decide — the naive starter forwards everything ===\n")
+    print("\n=== Gateway.decide — valid commands are forwarded ===\n")
     ctx = RecordingGatewayContext(
         act="learner:sv-0401",
         sub="agent:demo-team",
@@ -552,7 +595,7 @@ if __name__ == "__main__":
         assert call_dict["tool"] == cmd.tool
         assert tuple(call_dict["fields"]) == cmd.fields
 
-    print(f"\n=== Gateway.deny — the unused-by-default free-abstention path ===\n")
+    print(f"\n=== Gateway.deny — the free-abstention path ===\n")
     denial = gw.deny(demo_commands[0], reason="demo: withholding pending a fresher registry.provenance read")
     print(f"  gw.deny(...) -> verdict={denial.verdict!r} reason={denial.reason!r} call={denial.call!r}")
     assert denial.verdict == "deny"
